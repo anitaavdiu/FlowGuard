@@ -3,3 +3,4 @@ uvicorn
 pydantic
 anthropic
 python-dotenv
+pytest
