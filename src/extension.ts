@@ -1,60 +1,25 @@
 import * as vscode from 'vscode';
 
-const LOG_INTERVAL_MS = 60_000;
-const TELEMETRY_ENDPOINT = 'http://127.0.0.1:8000/telemetry';
+import { SemanticAnalyzer } from './analysis/semanticAnalyzer';
+import {
+  buildPayload,
+  CognitiveState,
+  Diagnosis,
+  sendTelemetry,
+} from './telemetry/client';
+import {
+  clearPendingPatch,
+  FlowGuardPatchProvider,
+  initPatchProvider,
+  registerPatchCommand,
+  setPendingPatch,
+} from './utils/patchProvider';
 
-type CognitiveState = 'FLOW' | 'NORMAL' | 'OVERLOADED';
+const LOG_INTERVAL_MS = 60_000;
 
 interface WindowMetrics {
   backspaceCount: number;
   fileSwitchCount: number;
-}
-
-interface TelemetryPayload {
-  backspaceCount: number;
-  fileSwitchCount: number;
-  errorCount: number;
-  activeFile?: string;
-  snippet?: string;
-  diagnostics?: string[];
-}
-
-interface Diagnosis {
-  trigger: string;
-  root_cause: string;
-  patch: string;
-  confidence: number;
-}
-
-interface TelemetryResponse {
-  score: number;
-  state: CognitiveState;
-  diagnosis?: Diagnosis;
-}
-
-let metrics: WindowMetrics = { backspaceCount: 0, fileSwitchCount: 0 };
-let logTimer: ReturnType<typeof setInterval> | undefined;
-let statusBarItem: vscode.StatusBarItem;
-let outputChannel: vscode.OutputChannel;
-let lastState: CognitiveState | undefined;
-
-function isDeletion(change: vscode.TextDocumentContentChangeEvent): boolean {
-  return change.text.length === 0 && change.rangeLength > 0;
-}
-
-function countTotalDiagnostics(): { errors: number; warnings: number } {
-  let errors = 0;
-  let warnings = 0;
-  for (const [, diagnostics] of vscode.languages.getDiagnostics()) {
-    for (const diagnostic of diagnostics) {
-      if (diagnostic.severity === vscode.DiagnosticSeverity.Error) {
-        errors++;
-      } else if (diagnostic.severity === vscode.DiagnosticSeverity.Warning) {
-        warnings++;
-      }
-    }
-  }
-  return { errors, warnings };
 }
 
 const STATE_DISPLAY: Record<
@@ -70,6 +35,29 @@ const STATE_DISPLAY: Record<
   },
 };
 
+let metrics: WindowMetrics = { backspaceCount: 0, fileSwitchCount: 0 };
+let logTimer: ReturnType<typeof setInterval> | undefined;
+let statusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
+let lastState: CognitiveState | undefined;
+const semanticAnalyzer = new SemanticAnalyzer();
+
+function isDeletion(change: vscode.TextDocumentContentChangeEvent): boolean {
+  return change.text.length === 0 && change.rangeLength > 0;
+}
+
+function countTotalDiagnostics(): { errors: number; warnings: number } {
+  let errors = 0;
+  let warnings = 0;
+  for (const [, diagnostics] of vscode.languages.getDiagnostics()) {
+    for (const d of diagnostics) {
+      if (d.severity === vscode.DiagnosticSeverity.Error) errors++;
+      else if (d.severity === vscode.DiagnosticSeverity.Warning) warnings++;
+    }
+  }
+  return { errors, warnings };
+}
+
 function updateStatusBar(state: CognitiveState, score: number): void {
   const display = STATE_DISPLAY[state];
   statusBarItem.text = `${display.icon} FlowGuard: ${display.label}`;
@@ -78,89 +66,39 @@ function updateStatusBar(state: CognitiveState, score: number): void {
   statusBarItem.show();
 }
 
-function getCodeSnippet(): string | undefined {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    return undefined;
-  }
-  const doc = editor.document;
-  const cursor = editor.selection.active;
-  const start = Math.max(0, cursor.line - 15);
-  const end = Math.min(doc.lineCount - 1, cursor.line + 15);
-  const lines: string[] = [];
-  for (let i = start; i <= end; i++) {
-    lines.push(`${i === cursor.line ? '→' : ' '} ${doc.lineAt(i).text}`);
-  }
-  return lines.join('\n');
-}
-
-function getActiveFileDiagnostics(): string[] {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    return [];
-  }
-  return vscode.languages
-    .getDiagnostics(editor.document.uri)
-    .filter((d) => d.severity === vscode.DiagnosticSeverity.Error)
-    .slice(0, 5)
-    .map((d) => d.message);
-}
-
 function handleOverloadTransition(diagnosis: Diagnosis | undefined): void {
   if (diagnosis) {
-    const confidence = (diagnosis.confidence * 100).toFixed(0);
-    const message = `FlowGuard: ${diagnosis.trigger} — ${diagnosis.patch} (${confidence}% confidence)`;
+    const pct = (diagnosis.confidence * 100).toFixed(0);
+    const message = `FlowGuard: ${diagnosis.trigger} — ${diagnosis.patch} (${pct}% confidence)`;
     outputChannel.appendLine(`[FlowGuard] Diagnosis: ${JSON.stringify(diagnosis)}`);
     void vscode.window.showWarningMessage(message);
   } else {
-    outputChannel.appendLine('[FlowGuard] OVERLOADED — no diagnosis available (check ANTHROPIC_API_KEY)');
-    void vscode.window.showWarningMessage('FlowGuard: Cognitive overload detected. Consider a short break.');
-  }
-}
-
-async function sendTelemetry(payload: TelemetryPayload): Promise<TelemetryResponse | undefined> {
-  try {
-    const response = await fetch(TELEMETRY_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      throw new Error(`backend responded with ${response.status}`);
-    }
-    return (await response.json()) as TelemetryResponse;
-  } catch (error) {
-    outputChannel.appendLine(`[FlowGuard] Telemetry POST failed: ${String(error)}`);
-    return undefined;
+    outputChannel.appendLine(
+      '[FlowGuard] OVERLOADED — no diagnosis available (check ANTHROPIC_API_KEY)',
+    );
+    void vscode.window.showWarningMessage(
+      'FlowGuard: cognitive overload detected. Consider a short break.',
+    );
   }
 }
 
 async function logMetrics(): Promise<void> {
-  const { errors, warnings } = countTotalDiagnostics();
+  const { errors } = countTotalDiagnostics();
   const editor = vscode.window.activeTextEditor;
-  const payload: TelemetryPayload = {
-    backspaceCount: metrics.backspaceCount,
-    fileSwitchCount: metrics.fileSwitchCount,
-    errorCount: errors,
-    activeFile: editor?.document.fileName,
-    snippet: getCodeSnippet(),
-    diagnostics: getActiveFileDiagnostics(),
-  };
 
-  console.log(
-    '[FlowGuard]',
-    JSON.stringify({
-      timestamp: new Date().toISOString(),
-      backspacesPerMinute: payload.backspaceCount,
-      fileSwitchesPerMinute: payload.fileSwitchCount,
-      workspaceErrors: errors,
-      workspaceWarnings: warnings,
-    }),
+  const payload = buildPayload(
+    metrics.backspaceCount,
+    metrics.fileSwitchCount,
+    errors,
+    semanticAnalyzer.getSemanticTrigger(
+      editor ? getSnippetText(editor) : undefined,
+    ),
+    outputChannel,
   );
 
   metrics = { backspaceCount: 0, fileSwitchCount: 0 };
 
-  const result = await sendTelemetry(payload);
+  const result = await sendTelemetry(payload, outputChannel);
   if (!result) {
     return;
   }
@@ -170,24 +108,65 @@ async function logMetrics(): Promise<void> {
 
   if (result.state === 'OVERLOADED' && lastState !== 'OVERLOADED') {
     handleOverloadTransition(result.diagnosis);
+
+    if (result.diagnosis?.patch_code && editor) {
+      const cursor = editor.selection.active;
+      setPendingPatch(
+        editor.document.uri,
+        cursor.line,
+        result.diagnosis.patch_code,
+        result.diagnosis.trigger,
+      );
+    }
   }
+
+  if (result.state !== 'OVERLOADED') {
+    clearPendingPatch();
+  }
+
   lastState = result.state;
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-  console.log('[FlowGuard] activated');
+// Returns the raw text of the snippet window around the cursor, without the
+// arrow markers, so the semantic analyzer can count brackets correctly.
+function getSnippetText(editor: vscode.TextEditor): string {
+  const doc = editor.document;
+  const cursor = editor.selection.active;
+  const start = Math.max(0, cursor.line - 15);
+  const end = Math.min(doc.lineCount - 1, cursor.line + 15);
+  const lines: string[] = [];
+  for (let i = start; i <= end; i++) {
+    lines.push(doc.lineAt(i).text);
+  }
+  return lines.join('\n');
+}
 
+export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel('FlowGuard');
+  outputChannel.appendLine('[FlowGuard] activated');
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.text = `${STATE_DISPLAY.NORMAL.icon} FlowGuard: Normal`;
   statusBarItem.show();
 
+  initPatchProvider(context);
+  registerPatchCommand(context);
+
+  context.subscriptions.push(
+    vscode.languages.registerCodeActionsProvider(
+      { scheme: 'file' },
+      new FlowGuardPatchProvider(),
+      { providedCodeActionKinds: FlowGuardPatchProvider.providedCodeActionKinds },
+    ),
+  );
+
   const textChangeListener = vscode.workspace.onDidChangeTextDocument((event) => {
     for (const change of event.contentChanges) {
-      if (isDeletion(change)) {
+      const del = isDeletion(change);
+      if (del) {
         metrics.backspaceCount++;
       }
+      semanticAnalyzer.recordEdit(change.range.start.line, del);
     }
   });
 
