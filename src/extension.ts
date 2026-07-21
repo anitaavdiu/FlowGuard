@@ -14,11 +14,22 @@ interface TelemetryPayload {
   backspaceCount: number;
   fileSwitchCount: number;
   errorCount: number;
+  activeFile?: string;
+  snippet?: string;
+  diagnostics?: string[];
+}
+
+interface Diagnosis {
+  trigger: string;
+  root_cause: string;
+  patch: string;
+  confidence: number;
 }
 
 interface TelemetryResponse {
   score: number;
   state: CognitiveState;
+  diagnosis?: Diagnosis;
 }
 
 let metrics: WindowMetrics = { backspaceCount: 0, fileSwitchCount: 0 };
@@ -67,28 +78,43 @@ function updateStatusBar(state: CognitiveState, score: number): void {
   statusBarItem.show();
 }
 
-// Stand-in for a real Anthropic API call. Swap the body of this function for an
-// `anthropic.messages.create(...)` request (reading the API key from an env var
-// or vscode SecretStorage) when a live agent connection is wanted.
-const STEP_DOWN_HINTS = [
-  'Take a 2-minute break — step away from the keyboard and look away from the screen.',
-  "Close extra tabs/files and focus on just the one you're editing.",
-  'Re-read the last error message slowly before making another change.',
-  'Try explaining the bug out loud, as if to a colleague, before touching the code again.',
-  'Save your progress and take a short walk — the fix will still be there in 5 minutes.',
-];
-
-async function fetchStepDownHint(): Promise<string> {
-  return STEP_DOWN_HINTS[Math.floor(Math.random() * STEP_DOWN_HINTS.length)];
+function getCodeSnippet(): string | undefined {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return undefined;
+  }
+  const doc = editor.document;
+  const cursor = editor.selection.active;
+  const start = Math.max(0, cursor.line - 15);
+  const end = Math.min(doc.lineCount - 1, cursor.line + 15);
+  const lines: string[] = [];
+  for (let i = start; i <= end; i++) {
+    lines.push(`${i === cursor.line ? '→' : ' '} ${doc.lineAt(i).text}`);
+  }
+  return lines.join('\n');
 }
 
-async function handleOverloadTransition(): Promise<void> {
-  try {
-    const hint = await fetchStepDownHint();
-    outputChannel.appendLine(`[FlowGuard] Step-down hint: ${hint}`);
-    void vscode.window.showWarningMessage(`FlowGuard: You seem overloaded. ${hint}`);
-  } catch (error) {
-    outputChannel.appendLine(`[FlowGuard] Failed to fetch step-down hint: ${String(error)}`);
+function getActiveFileDiagnostics(): string[] {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return [];
+  }
+  return vscode.languages
+    .getDiagnostics(editor.document.uri)
+    .filter((d) => d.severity === vscode.DiagnosticSeverity.Error)
+    .slice(0, 5)
+    .map((d) => d.message);
+}
+
+function handleOverloadTransition(diagnosis: Diagnosis | undefined): void {
+  if (diagnosis) {
+    const confidence = (diagnosis.confidence * 100).toFixed(0);
+    const message = `FlowGuard: ${diagnosis.trigger} — ${diagnosis.patch} (${confidence}% confidence)`;
+    outputChannel.appendLine(`[FlowGuard] Diagnosis: ${JSON.stringify(diagnosis)}`);
+    void vscode.window.showWarningMessage(message);
+  } else {
+    outputChannel.appendLine('[FlowGuard] OVERLOADED — no diagnosis available (check ANTHROPIC_API_KEY)');
+    void vscode.window.showWarningMessage('FlowGuard: Cognitive overload detected. Consider a short break.');
   }
 }
 
@@ -111,10 +137,14 @@ async function sendTelemetry(payload: TelemetryPayload): Promise<TelemetryRespon
 
 async function logMetrics(): Promise<void> {
   const { errors, warnings } = countTotalDiagnostics();
+  const editor = vscode.window.activeTextEditor;
   const payload: TelemetryPayload = {
     backspaceCount: metrics.backspaceCount,
     fileSwitchCount: metrics.fileSwitchCount,
     errorCount: errors,
+    activeFile: editor?.document.fileName,
+    snippet: getCodeSnippet(),
+    diagnostics: getActiveFileDiagnostics(),
   };
 
   console.log(
@@ -139,7 +169,7 @@ async function logMetrics(): Promise<void> {
   updateStatusBar(result.state, result.score);
 
   if (result.state === 'OVERLOADED' && lastState !== 'OVERLOADED') {
-    await handleOverloadTransition();
+    handleOverloadTransition(result.diagnosis);
   }
   lastState = result.state;
 }
