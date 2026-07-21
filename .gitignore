@@ -1,0 +1,9 @@
+out/
+node_modules/
+*.vsix
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+.env
+.claude/
