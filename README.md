@@ -118,6 +118,24 @@ pytest tests/ -v
 
 ---
 
+## Design decisions
+
+### Why a passive status bar instead of a popup?
+
+The obvious design for a cognitive load monitor is to throw a popup in your face the moment the score spikes. I deliberately didn't do that, and it's probably the most intentional decision in the project.
+
+The core problem: if you're already overloaded, an interruption makes it worse. There's a reasonable body of research on this — Iqbal & Bailey (2006) showed that the cost of an interruption isn't just the time it takes to dismiss it, it's the time it takes to rebuild your mental context afterward. That can be several minutes. A tool that's supposed to reduce cognitive load shouldn't be adding to it every time it fires.
+
+So FlowGuard uses a layered interruption model instead:
+
+1. **Status bar (always visible, never interrupting)** — sits in peripheral vision. You can glance at it without breaking focus. If you're in flow, you won't even notice it. This is the primary feedback channel.
+2. **Warning notification (fires once, on transition only)** — only triggers when you *cross into* OVERLOADED, not while you stay there. If you're stuck for five minutes, you get one notification, not five. Repeated alerts for the same condition are just noise — they train you to ignore the tool entirely.
+3. **Quick Fix (opt-in, on demand)** — the AI diagnosis and code patch are there if you want them, accessible via Ctrl+., but they never force themselves on you. You're in control of whether to act on it.
+
+The tradeoff I accepted is that the status bar is easy to miss if you're deep in a problem — which is exactly when you most need it. A more aggressive design might track eye gaze or use ambient light changes instead of a text label. But for a prototype, the passive bar felt like the right balance between useful and annoying. The goal was something you'd actually leave running, not something you'd disable after a day.
+
+---
+
 ## Project structure
 
 ```
